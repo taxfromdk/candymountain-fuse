@@ -4,9 +4,11 @@
  */
 #include "json.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static int checks_run;
 
@@ -21,6 +23,21 @@ static int checks_run;
 static json_t *parse(const char *s)
 {
     return json_parse(s, strlen(s), NULL);
+}
+
+typedef struct { const char *text; size_t len; int ok; } big_t;
+
+static void *big_main(void *arg)
+{
+    big_t *b = arg;
+    json_t *j = json_parse(b->text, b->len, NULL);
+    const json_t *items = json_get(j, "items");
+
+    b->ok = j != NULL && json_len(items) == 200000 &&
+            json_int(json_get(json_at(items, 199999), "pts"), 0) == 324000000 + 199999 * 3003 &&
+            json_int(json_get(json_at(items, 12), "segment"), -1) == 1;
+    json_free(j);
+    return NULL;
 }
 
 int main(void)
@@ -107,6 +124,36 @@ int main(void)
         json_free(j);
         free(big);
     }
+    /* a frame listing page: 200,000 small objects, parsed in a thread (a
+     * FUSE worker is one), must take well under a second, not minutes - the
+     * parser once allocated "the rest of the document" for every string,
+     * which glibc's thread arenas turned into a heap trim and regrow per
+     * key */
+    {
+        size_t n = 200000, cap = n * 96 + 64, len = 0;
+        char *doc = malloc(cap);
+        pthread_t th;
+        big_t b = { NULL, 0, 0 };
+        struct timespec t0, t1;
+
+        CHECK(doc != NULL);
+        len += (size_t)snprintf(doc + len, cap - len, "{\"frames\":%zu,\"items\":[", n);
+        for (size_t k = 0; k < n; k++)
+            len += (size_t)snprintf(doc + len, cap - len,
+                                    "%s{\"i\":%zu,\"pts\":%zu,\"key_offset\":%zu,\"segment\":%zu,\"size\":%zu}",
+                                    k ? "," : "", k, 324000000 + k * 3003, k % 12, k / 12, 50000 + k % 777);
+        len += (size_t)snprintf(doc + len, cap - len, "]}");
+        b.text = doc; b.len = len;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        CHECK(pthread_create(&th, NULL, big_main, &b) == 0);
+        pthread_join(th, NULL);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        CHECK(b.ok);
+        CHECK((double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9 < 10.0);
+        free(doc);
+        printf("  200,000-item listing parsed in a thread\n");
+    }
+
     printf("test_json: PASS (%d checks)\n", checks_run);
     return 0;
 }

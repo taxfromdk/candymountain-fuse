@@ -18,6 +18,15 @@ struct json {
 typedef struct {
     const char *p, *end;
     int depth;
+    char *scratch;      /* one buffer the size of the document, reused for
+                           every string: unescaping never grows a string, so
+                           it always fits. Each string is then copied out at
+                           its exact size. (Allocating "the rest of the
+                           document" per string, as this once did, meant
+                           half a million 12 MB malloc/free pairs per frame
+                           listing page; glibc's main arena shrugged that
+                           off, a thread arena trimmed and regrew its heap
+                           every time and a listing took minutes.) */
 } parser_t;
 
 #define MAX_DEPTH 64
@@ -64,7 +73,7 @@ static void skip_ws(parser_t *ps)
         ps->p++;
 }
 
-static int push(json_t *c, const char *key, json_t *v)
+static int push(json_t *c, char *key, json_t *v)
 {
     if (c->u.c.n == c->u.c.cap) {
         size_t cap = c->u.c.cap ? c->u.c.cap * 2 : 8;
@@ -83,11 +92,8 @@ static int push(json_t *c, const char *key, json_t *v)
         c->u.c.cap = cap;
     }
     c->u.c.items[c->u.c.n] = v;
-    if (c->type == JSON_OBJECT) {
-        c->u.c.keys[c->u.c.n] = strdup(key);
-        if (c->u.c.keys[c->u.c.n] == NULL)
-            return -1;
-    }
+    if (c->type == JSON_OBJECT)
+        c->u.c.keys[c->u.c.n] = key;         /* owned from here on */
     c->u.c.n++;
     return 0;
 }
@@ -121,19 +127,16 @@ static size_t utf8_put(char *out, uint32_t cp)
     return 4;
 }
 
-/* Parse a string starting at the opening quote; returns malloc'd text. */
+/* Parse a string starting at the opening quote; returns malloc'd text of
+ * exactly its length. */
 static char *parse_string(parser_t *ps)
 {
-    char *out;
-    size_t o = 0, cap;
+    char *out = ps->scratch, *copy;
+    size_t o = 0;
 
     if (ps->p >= ps->end || *ps->p != '"')
         return NULL;
     ps->p++;
-    cap = (size_t)(ps->end - ps->p) + 1;   /* unescaping never grows */
-    out = malloc(cap);
-    if (out == NULL)
-        return NULL;
     while (ps->p < ps->end && *ps->p != '"') {
         unsigned char c = (unsigned char)*ps->p++;
 
@@ -193,10 +196,13 @@ static char *parse_string(parser_t *ps)
     if (ps->p >= ps->end)
         goto bad;
     ps->p++;                                 /* closing quote */
-    out[o] = '\0';
-    return out;
+    copy = malloc(o + 1);
+    if (copy == NULL)
+        return NULL;
+    memcpy(copy, out, o);
+    copy[o] = '\0';
+    return copy;
 bad:
-    free(out);
     return NULL;
 }
 
@@ -279,7 +285,6 @@ static json_t *parse_container(parser_t *ps, json_type_t type)
             json_free(v);
             goto bad;
         }
-        free(key);
         skip_ws(ps);
         if (ps->p >= ps->end)
             goto bad;
@@ -351,9 +356,16 @@ static json_t *parse_value(parser_t *ps)
 
 json_t *json_parse(const char *text, size_t len, size_t *errpos)
 {
-    parser_t ps = { text, text + len, 0 };
-    json_t *j = parse_value(&ps);
+    parser_t ps = { text, text + len, 0, NULL };
+    json_t *j;
 
+    ps.scratch = malloc(len + 1);
+    if (ps.scratch == NULL) {
+        if (errpos != NULL)
+            *errpos = 0;
+        return NULL;
+    }
+    j = parse_value(&ps);
     if (j != NULL) {
         skip_ws(&ps);
         if (ps.p != ps.end) {
@@ -363,6 +375,7 @@ json_t *json_parse(const char *text, size_t len, size_t *errpos)
     }
     if (j == NULL && errpos != NULL)
         *errpos = (size_t)(ps.p - text);
+    free(ps.scratch);
     return j;
 }
 

@@ -54,7 +54,15 @@ a larger number than the file delivers.
 # How it works
 
 `src/json.c` is a small JSON parser (tree, lookups by key and position,
-escapes, int64 and double numbers, depth-limited). `src/api.c` does HTTP
+escapes, int64 and double numbers, depth-limited). Strings are unescaped
+into one scratch buffer the size of the document and copied out at their
+exact length: the parser once allocated "the rest of the document" for
+every string, half a million 12 MB malloc/free pairs per frame listing
+page, which glibc's main arena absorbed (a listing took a second) but a
+thread arena - every FUSE worker is one - answered with a heap trim and
+regrow per key, and a 190,000-frame folder took nine minutes to list and
+the process was killed. `test_json` parses a 200,000-item listing in a
+thread under a time bound so this cannot come back. `src/api.c` does HTTP
 GET with libcurl, one easy handle per thread kept alive between calls,
 mapping 404 to ENOENT, 503 to EAGAIN and the rest to EIO. `src/catalog.c`
 holds what the server has, as the filesystem sees it, and fetches on
@@ -93,7 +101,9 @@ heavy happens until a frame folder is listed or a frame read.
 
 # Tests
 
-`make test` runs `test_json` (natively and under valgrind) and
+`make test` runs `test_json` (natively and under valgrind; it ends with a
+200,000-item listing parsed in a thread, which must take well under a
+second) and
 `tests/test_mount.sh`: a real `ixserve` (candymountain's, built) on a
 free port over its test recordings as index 0 plus a one-recording second
 index, mounted with `ixmount -f`; it checks a dead URL is refused before
